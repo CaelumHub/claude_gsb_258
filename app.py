@@ -22,6 +22,7 @@ if BASE_DIR not in sys.path:
 from pipeline import PipelineEngine          # noqa: E402
 from storage import StoreRegistry             # noqa: E402
 from web import api                           # noqa: E402
+from web.routes import bootstrap_classifier   # noqa: E402
 
 
 def create_app(data_root: str | None = None) -> Flask:
@@ -38,6 +39,9 @@ def create_app(data_root: str | None = None) -> Flask:
     app.config["STORE_REGISTRY"] = registry
     app.config["PIPELINE_ENGINE"] = engine
     app.config["JSON_AS_ASCII"] = False
+
+    # 载入磁盘中的分类模型；旧数据目录缺模型文件时会从示例分片恢复。
+    bootstrap_classifier(registry, data_root)
 
     app.register_blueprint(api)
 

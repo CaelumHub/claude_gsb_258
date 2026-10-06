@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nlp import (get_keywords, get_ner, get_parser, get_segmenter,
                  get_sentiment, get_summarizer, get_tagger, get_translator,
-                 get_constituency_parser)
+                 get_constituency_parser, get_classifier)
 from nlp.lexicon import STOPWORDS
 
 from .stage import Stage
@@ -70,6 +70,16 @@ def _parse(ctx, params):
     return {"parse": {"dependency": dep, "constituency": const}}
 
 
+def _classify(ctx, params):
+    text = ctx.get("clean_text") or ctx.get("text", "")
+    thresholds = {key: params[key] for key in params
+                  if key in {"accept_confidence", "review_confidence",
+                             "ambiguous_confidence", "min_fit", "margin",
+                             "ratio", "temperature"}}
+    return {"classification": get_classifier(
+        ctx.get("classifier_path")).classify(text, thresholds=thresholds)}
+
+
 BUILTIN_STAGES = [
     Stage("clean", _clean, inputs=["text"], outputs=["clean_text"],
           description="文本清洗：去空白、去停用词", params={"remove_stopwords": True}),
@@ -89,4 +99,6 @@ BUILTIN_STAGES = [
           description="机器翻译（模拟）", params={"direction": "zh2en"}),
     Stage("parse", _parse, inputs=["text", "clean_text"], outputs=["parse"],
           description="句法分析"),
+    Stage("classify", _classify, inputs=["text", "clean_text"], outputs=["classification"],
+          description="少样本文本自动分类（增量 TF-IDF）"),
 ]

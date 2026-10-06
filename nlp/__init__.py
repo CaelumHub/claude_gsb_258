@@ -16,16 +16,18 @@ from .summarizer import Summarizer
 from .translator import Translator
 from .keywords import KeywordExtractor
 from .embeddings import WordEmbeddings
+from .classifier import IncrementalTextClassifier
 from . import lexicon, text, hmm
 
 __all__ = [
     "Segmenter", "POSTagger", "DependencyParser", "ConstituencyParser",
     "NERExtractor", "SentimentAnalyzer", "Summarizer", "Translator",
-    "KeywordExtractor", "WordEmbeddings",
+    "KeywordExtractor", "WordEmbeddings", "IncrementalTextClassifier",
     "TAG_NAMES", "TAGSET", "DEP_REL_NAMES", "PHRASE_NAMES", "ENTITY_TYPE_NAMES",
     "POLARITY_NAMES", "lexicon", "text", "hmm",
     "get_segmenter", "get_tagger", "get_parser", "get_ner", "get_sentiment",
     "get_summarizer", "get_translator", "get_keywords", "get_embeddings",
+    "get_classifier",
 ]
 
 
@@ -78,3 +80,12 @@ def get_keywords() -> KeywordExtractor:
 
 def get_embeddings() -> WordEmbeddings:
     return _singleton("embeddings", WordEmbeddings)
+
+
+def get_classifier(path: str | None = None) -> IncrementalTextClassifier:
+    """获取分类器；Web 默认模型用单例，测试或自定义路径可独立加载。"""
+    key = f"classifier:{path or 'default'}"
+    with _lock:
+        if key not in _instances:
+            _instances[key] = IncrementalTextClassifier(path=path)
+        return _instances[key]

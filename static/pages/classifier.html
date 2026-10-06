@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文档自动分类 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .class-card { border: 1px solid var(--border); border-radius: 9px; padding: 12px; margin-bottom: 10px; background: #fff; }
+    .class-card.active { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+    .class-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .class-name { font-weight: 700; }
+    .class-desc { color: var(--text-muted); font-size: 12px; margin: 5px 0; word-break: break-all; }
+    .check-pill { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; margin: 4px 6px 4px 0; cursor: pointer; user-select: none; background: #fff; }
+    .check-pill input { width: auto; }
+    .check-pill.on { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+    .candidate { border: 1px solid var(--border); border-radius: 9px; padding: 11px 12px; margin: 9px 0; }
+    .candidate.chosen { border-color: #93c5fd; background: #f8fbff; }
+    .candidate .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .candidate .track { height: 9px; background: #edf0f6; border-radius: 999px; overflow: hidden; margin-top: 8px; }
+    .candidate .fill { height: 100%; background: linear-gradient(90deg, var(--primary), #7c93ff); }
+    .candidate .nums { display: flex; gap: 14px; font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+    .examples textarea { min-height: 92px; }
+    .example-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
+    .example-item:last-child { border-bottom: 0; }
+    .example-text { margin: 5px 0; color: var(--text); }
+    .term-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+    .term-chips span { font-size: 11px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; color: var(--text-muted); }
+    details.advanced { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 12px; }
+    summary { cursor: pointer; color: var(--text-muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">文档自动分类</h1>
+    <p class="page-desc">用户只需为每个类别提供少量示例；模型增量吸收新示例，输出类别、置信度与边界候选。</p>
+
+    <div class="grid cols-2">
+      <section class="card">
+        <h2>类别定义</h2>
+        <div class="row mb">
+          <div class="grow"><label>类别名称</label><input type="text" id="new-class-name" placeholder="例如：财务 / 技术 / 法务"></div>
+        </div>
+        <label>类别说明（可选，帮助团队理解边界）</label>
+        <input type="text" id="new-class-desc" class="mb" placeholder="例如：发票、报销、预算、审计">
+        <button class="btn" id="btn-add-class">新增类别</button>
+        <div id="class-list" class="mt"></div>
+      </section>
+
+      <section class="card examples">
+        <h2>添加示例（可多标签）</h2>
+        <div id="example-label-picker" class="mb"><span class="muted small">请先创建至少两个类别。</span></div>
+        <textarea id="example-text" placeholder="输入该类别下的一段典型文档……"></textarea>
+        <div class="row mt">
+          <button class="btn" id="btn-add-example">学习此示例</button>
+          <button class="btn secondary" id="btn-demo">填充演示数据</button>
+          <button class="btn secondary" id="btn-rebuild">从示例重建</button>
+        </div>
+        <div id="model-stats" class="mt muted small"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>分类新文档</h2>
+      <textarea id="doc-text" style="min-height:150px" placeholder="粘贴一篇新文档；同一模型版本下重复分类将得到一致结果。"></textarea>
+      <div class="row mt">
+        <button class="btn" id="btn-classify">自动分类</button>
+        <button class="btn secondary" id="btn-batch">分类全部语料</button>
+        <span id="classify-status" class="muted small"></span>
+      </div>
+
+      <details class="advanced">
+        <summary>置信度与边界阈值（高级）</summary>
+        <div class="grid cols-3 mt">
+          <div><label>确定阈值</label><input type="number" id="accept_confidence" min="0" max="1" step="0.01" placeholder="0.68"></div>
+          <div><label>复核阈值</label><input type="number" id="review_confidence" min="0" max="1" step="0.01" placeholder="0.55"></div>
+          <div><label>多候选阈值</label><input type="number" id="ambiguous_confidence" min="0" max="1" step="0.01" placeholder="0.40"></div>
+          <div><label>最低拟合度</label><input type="number" id="min_fit" min="0" max="1" step="0.01" placeholder="0.18"></div>
+          <div><label>候选相似度比例</label><input type="number" id="ratio" min="0" max="1" step="0.01" placeholder="0.70"></div>
+          <div><label>候选间隔</label><input type="number" id="margin" min="0" max="1" step="0.01" placeholder="0.10"></div>
+          <div><label>Softmax 温度</label><input type="number" id="temperature" min="0.01" max="1" step="0.01" placeholder="0.12"></div>
+        </div>
+      </details>
+
+      <div id="classification-result" class="mt"></div>
+      <div id="batch-result" class="mt"></div>
+    </section>
+
+    <section class="card">
+      <h2>类别边界画像</h2>
+      <p class="muted small">权重最高的词反映当前示例学到的边界；增加或替换示例后，画像会随增量统计更新。</p>
+      <div id="profile-list" class="grid cols-3"></div>
+    </section>
+
+    <section class="card">
+      <h2>已学习示例</h2>
+      <div id="example-list" class="examples"></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("classifier.html");
+
+let classes = [];
+let selectedLabels = new Set();
+let lastResult = null;
+
+async function loadAll() {
+  const data = await api("/api/classifier/classes");
+  classes = data.classes || [];
+  // 清掉已删除类别选择
+  selectedLabels = new Set([...selectedLabels].filter(id => classes.some(c => c.id === id)));
+  renderClasses();
+  renderPicker();
+  renderStats(data.stats);
+  renderProfile(data.profile || []);
+  const ex = await api("/api/classifier/examples");
+  renderExamples(ex.examples || []);
+}
+
+function renderStats(stats) {
+  $("#model-stats").innerHTML = stats
+    ? `模型版本 <b>v${stats.model_version}</b> · 示例 <b>${stats.document_count}</b> · 特征词 <b>${stats.vocab_size}</b> · 有效类别 <b>${stats.active_class_count}/${stats.class_count}</b>`
+    : "";
+}
+
+function renderClasses() {
+  if (!classes.length) {
+    $("#class-list").innerHTML = `<div class="muted small">尚未定义类别。</div>`;
+    return;
+  }
+  $("#class-list").innerHTML = classes.map(c => `
+    <div class="class-card">
+      <div class="class-head">
+        <span class="class-name">${esc(c.name)} <span class="badge blue">${c.example_count} 例</span></span>
+        <button class="btn small danger" data-del-class="${esc(c.id)}">删除</button>
+      </div>
+      <div class="class-desc">${esc(c.description || "无说明")}</div>
+    </div>`).join("");
+  $$("[data-del-class]").forEach(btn => btn.addEventListener("click", async () => {
+    const cid = btn.dataset.delClass;
+    const c = classes.find(x => x.id === cid);
+    if (!confirm(`删除「${c.name}」及其全部示例？`)) return;
+    await api(`/api/classifier/classes/${encodeURIComponent(cid)}`, { method: "DELETE" });
+    toast("类别已删除");
+    await loadAll();
+  }));
+}
+
+function renderPicker() {
+  if (classes.length < 2) {
+    $("#example-label-picker").innerHTML = `<span class="muted small">请先创建至少两个类别。</span>`;
+    return;
+  }
+  $("#example-label-picker").innerHTML = classes.map(c => `
+    <label class="check-pill ${selectedLabels.has(c.id) ? "on" : ""}">
+      <input type="checkbox" value="${esc(c.id)}" ${selectedLabels.has(c.id) ? "checked" : ""}>
+      ${esc(c.name)}
+    </label>`).join("");
+  $$('#example-label-picker input').forEach(input => input.addEventListener("change", () => {
+    input.checked ? selectedLabels.add(input.value) : selectedLabels.delete(input.value);
+    renderPicker();
+  }));
+}
+
+function renderProfile(profile) {
+  if (!profile.length) {
+    $("#profile-list").innerHTML = `<div class="muted small">添加示例后显示类别关键词。</div>`;
+    return;
+  }
+  $("#profile-list").innerHTML = profile.map(p => `
+    <div class="class-card">
+      <div class="class-name">${esc(p.class_name)} <span class="muted small">${p.example_count} 例</span></div>
+      <div class="term-chips">${(p.top_terms || []).map(t => `<span>${esc(t.term)} ${t.weight}</span>`).join("") || '<span class="muted">暂无</span>'}</div>
+    </div>`).join("");
+}
+
+function renderExamples(examples) {
+  if (!examples.length) {
+    $("#example-list").innerHTML = `<div class="muted small">尚未添加示例。</div>`;
+    return;
+  }
+  $("#example-list").innerHTML = examples.slice(0, 100).map(e => `
+    <div class="example-item">
+      <div class="row">
+        <div class="grow">${(e.labels || []).map(x => `<span class="badge blue">${esc(x)}</span>`).join(" ")}</div>
+        <button class="btn small danger" data-del-example="${esc(e.id)}">删除示例</button>
+      </div>
+      <div class="example-text">${esc(e.text)}</div>
+      <div class="term-chips">${(e.terms || []).slice(0, 18).map(t => `<span>${esc(t)}</span>`).join("")}</div>
+    </div>`).join("");
+  $$("[data-del-example]").forEach(btn => btn.addEventListener("click", async () => {
+    await api(`/api/classifier/examples/${encodeURIComponent(btn.dataset.delExample)}`, { method: "DELETE" });
+    toast("示例已移除，模型已增量更新");
+    await loadAll();
+  }));
+}
+
+async function addClass() {
+  const name = $("#new-class-name").value.trim();
+  if (!name) return toast("请输入类别名称", "err");
+  await api("/api/classifier/classes", { method: "POST", body: {
+    name, description: $("#new-class-desc").value.trim(),
+  }});
+  $("#new-class-name").value = "";
+  $("#new-class-desc").value = "";
+  toast("类别已创建");
+  await loadAll();
+}
+
+async function addExample() {
+  const text = $("#example-text").value.trim();
+  if (!text) return toast("请输入示例文本", "err");
+  if (!selectedLabels.size) return toast("请勾选一个或多个类别", "err");
+  const btn = $("#btn-add-example");
+  setLoading(btn, true, "学习中…");
+  try {
+    await api("/api/classifier/examples", { method: "POST", body: {
+      text, label_ids: [...selectedLabels],
+    }});
+    $("#example-text").value = "";
+    toast("示例已增量吸收");
+    await loadAll();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function thresholds() {
+  const keys = ["accept_confidence", "review_confidence", "ambiguous_confidence", "min_fit", "ratio", "temperature"];
+  const out = {};
+  for (const key of keys) {
+    const v = $(`#${key}`).value.trim();
+    if (v !== "") out[key] = Number(v);
+  }
+  return out;
+}
+
+const STATUS_TEXT = {
+  confident: ["确定", "green"],
+  multi_label: ["多标签候选", "blue"],
+  ambiguous: ["边界模糊", "amber"],
+  review: ["建议人工复核", "red"],
+};
+
+function renderResult(r, title = "分类结果") {
+  lastResult = r;
+  const [statusText, statusClass] = STATUS_TEXT[r.status] || ["未知", ""];
+  const accepted = r.candidates.filter(c => r.label_ids.includes(c.class_id));
+  const maxConf = Math.max(...r.candidates.map(c => c.confidence), 1);
+  $("#classification-result").innerHTML = `
+    <div class="row">
+      <h2 style="margin:0">${title}</h2>
+      <span class="badge ${statusClass}">${statusText}</span>
+      <span class="muted small">最高置信度 ${(r.confidence * 100).toFixed(1)}% · 拟合度 ${(r.fit * 100).toFixed(1)}% · 模型 v${r.model_version}</span>
+      <button class="btn small secondary" id="btn-save-result">作为示例学习</button>
+    </div>
+    ${!r.label_ids.length ? '<p class="muted small mt">系统不会强行把这篇文档塞入类别；可在下方选择正确类别后作为反馈示例。</p>' : ""}
+    ${r.candidates.map(c => {
+      const chosen = accepted.some(x => x.class_id === c.class_id);
+      return `<div class="candidate ${chosen ? "chosen" : ""}">
+        <div class="top"><b>${esc(c.class_name)}</b><span>${chosen ? "采纳候选" : "候选"} · ${(c.confidence * 100).toFixed(1)}%</span></div>
+        <div class="track"><div class="fill" style="width:${(c.confidence / maxConf * 100).toFixed(1)}%"></div></div>
+        <div class="nums"><span>余弦相似度：${c.similarity}</span><span>置信度：${c.confidence}</span></div>
+      </div>`;
+    }).join("")}`;
+  $("#btn-save-result").addEventListener("click", () => {
+    selectedLabels = new Set(r.label_ids.length ? r.label_ids : [r.candidates[0]?.class_id].filter(Boolean));
+    $("#example-text").value = $("#doc-text").value.trim();
+    renderPicker();
+    $("#example-text").scrollIntoView({ behavior: "smooth", block: "center" });
+    toast("已带入文本和候选类别，可调整后保存为示例");
+  });
+}
+
+async function classifyDoc() {
+  const text = $("#doc-text").value.trim();
+  if (!text) return toast("请输入待分类文档", "err");
+  const btn = $("#btn-classify");
+  setLoading(btn, true, "分类中…");
+  try {
+    const r = await api("/api/classifier/classify", { method: "POST", body: { text, ...thresholds() }});
+    $("#batch-result").innerHTML = "";
+    renderResult(r);
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+async function classifyBatch() {
+  const btn = $("#btn-batch");
+  setLoading(btn, true, "批量分类中…");
+  try {
+    const r = await api("/api/classifier/classify-batch", { method: "POST", body: { ...thresholds() }});
+    $("#classification-result").innerHTML = "";
+    $("#batch-result").innerHTML = `<h2>批量结果（${r.count} 篇）</h2>` + r.results.map((item, i) => {
+      const x = item.result;
+      const [statusText, cls] = STATUS_TEXT[x.status] || ["未知", ""];
+      const labels = x.labels.length ? x.labels.join(" / ") : "不自动归类";
+      return `<div class="candidate">
+        <div class="top"><b>#${i + 1} ${labels}</b><span class="badge ${cls}">${statusText}</span></div>
+        <div class="muted small mt">${esc(item.preview)}</div>
+        <div class="nums"><span>最高置信度 ${(x.confidence * 100).toFixed(1)}%</span><span>候选：${x.candidates.slice(0, 3).map(c => `${esc(c.class_name)} ${(c.confidence * 100).toFixed(0)}%`).join("，")}</span></div>
+      </div>`;
+    }).join("");
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function fillDemo() {
+  const nameInputs = [
+    ["财务报销", "发票、报销、预算、审计、利润、成本、税务"],
+    ["技术研发", "算法、模型、软件、系统、接口、服务器、漏洞"],
+    ["人力资源", "招聘、入职、绩效、薪酬、培训、员工、劳动合同"],
+  ];
+  const examples = [
+    [["财务报销"], "财务部完成本季度预算审计，员工提交差旅发票和报销单，税务申报材料已归档。"],
+    [["财务报销"], "公司营业收入增长，成本下降带来利润提升，下月将完成付款审批和现金流核算。"],
+    [["技术研发"], "算法团队训练机器学习模型，在GPU服务器上优化接口性能并修复线上系统漏洞。"],
+    [["技术研发"], "后端工程师发布微服务版本，完善日志监控、数据结构和自动化测试流程。"],
+    [["人力资源"], "人力资源部启动校园招聘，新员工完成入职培训并签订劳动合同。"],
+    [["人力资源"], "经理根据季度绩效调整薪酬，组织员工参加管理培训和岗位轮换。"],
+  ];
+  (async () => {
+    for (const [name, desc] of nameInputs) {
+      if (!classes.some(c => c.name === name)) {
+        await api("/api/classifier/classes", { method: "POST", body: { name, description: desc }});
+      }
+    }
+    await loadAll();
+    // loadAll 后重新读取刚创建的类别，避免闭包中的旧数组缺少新 id。
+    const current = await api("/api/classifier/classes");
+    classes = current.classes || [];
+    const byName = Object.fromEntries(classes.map(c => [c.name, c.id]));
+    for (const [labels, text] of examples) {
+      const ids = labels.map(x => byName[x]).filter(Boolean);
+      await api("/api/classifier/examples", { method: "POST", body: { label_ids: ids, text, source: "demo" }});
+    }
+    $("#doc-text").value = "财务团队使用算法模型审计发票，并和技术部门一起优化报销系统。";
+    toast("演示类别和示例已写入");
+    await loadAll();
+  })();
+}
+
+$("#btn-add-class").addEventListener("click", addClass);
+$("#btn-add-example").addEventListener("click", addExample);
+$("#btn-classify").addEventListener("click", classifyDoc);
+$("#btn-batch").addEventListener("click", classifyBatch);
+$("#btn-demo").addEventListener("click", fillDemo);
+$("#btn-rebuild").addEventListener("click", async () => {
+  await api("/api/classifier/rebuild", { method: "POST" });
+  toast("已从全部分片示例重建模型");
+  await loadAll();
+});
+
+loadAll().catch(e => toast(e.message, "err"));
+</script>
+</body>
+</html>

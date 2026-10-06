@@ -20,9 +20,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from nlp import (get_segmenter, get_tagger, get_parser, get_constituency_parser,
                  get_ner, get_sentiment, get_summarizer, get_translator,
                  get_keywords, get_embeddings, TAGSET)
+from nlp.classifier import IncrementalTextClassifier
 from nlp.hmm import HMM
 from pipeline import PipelineEngine, PipelineError
 from storage import ShardedStore, StoreRegistry
+
+try:
+    from app import create_app
+except ImportError:  # Flask 是 Web 运行时依赖，纯算法测试环境可不安装
+    create_app = None
 
 
 class TestSegmenter(unittest.TestCase):
@@ -151,6 +157,141 @@ class TestEmbeddings(unittest.TestCase):
         self.assertEqual(len(proj), len(emb.vectors))
 
 
+class TestIncrementalClassifier(unittest.TestCase):
+    def setUp(self):
+        self.clf = IncrementalTextClassifier()
+        self.clf.add_class("class_1", "财务")
+        self.clf.add_class("class_2", "技术")
+        self.finance = [
+            "财务部完成预算审计，员工提交发票报销和税务申报材料",
+            "公司确认营业收入和现金流，核算成本利润并完成付款审批",
+            "审计人员检查报销单、发票、预算执行情况和财务报表",
+        ]
+        self.tech = [
+            "算法团队训练机器学习模型，在服务器上优化推理性能",
+            "后端工程师发布微服务接口，修复系统漏洞并完善监控",
+            "软件开发人员重构数据结构，编写自动化测试和部署脚本",
+        ]
+        for text in self.finance:
+            self.clf.add_document(text, ["class_1"])
+        for text in self.tech:
+            self.clf.add_document(text, ["class_2"])
+
+    def test_confident_deterministic(self):
+        text = "请提交发票和报销单，财务部门完成预算审计"
+        a = self.clf.classify(text)
+        b = self.clf.classify(text)
+        self.assertEqual(a["fingerprint"], b["fingerprint"])
+        self.assertEqual(a["candidates"], b["candidates"])
+        self.assertEqual(a["status"], "confident")
+        self.assertEqual(a["label_ids"], ["class_1"])
+
+    def test_boundary_returns_candidates(self):
+        result = self.clf.classify("财务审计人员使用机器学习模型检查发票系统")
+        self.assertTrue(result["candidates"])
+        self.assertEqual(len({c["class_id"] for c in result["candidates"]}), 2)
+        self.assertIn(result["status"], {"ambiguous", "multi_label"})
+
+    def test_out_of_domain_review(self):
+        result = self.clf.classify("周末去公园跑步，晚上和朋友吃饭看电影")
+        self.assertEqual(result["status"], "review")
+        self.assertEqual(result["label_ids"], [])
+
+    def test_multi_label_example_can_match_both_classes(self):
+        self.clf.add_document(
+            "财务技术团队用机器学习模型自动审计发票和报销系统",
+            ["class_1", "class_2"])
+        result = self.clf.classify("机器学习模型自动审计发票和报销系统")
+        self.assertGreaterEqual(len(result["candidates"]), 2)
+        self.assertIn(result["status"], {"ambiguous", "multi_label"})
+
+    def test_incremental_boundary_changes_without_rebuild(self):
+        text = "财务团队上线自动发票识别模型并维护报销系统"
+        before = self.clf.classify(text)
+        version = self.clf.model_version
+        self.clf.add_document(
+            "财务团队开发发票识别模型，把报销审批系统接入自动审计", ["class_1"])
+        self.assertEqual(self.clf.model_version, version + 1)
+        after = self.clf.classify(text)
+        self.assertEqual(after["candidates"][0]["class_id"], "class_1")
+
+    def test_delete_example_updates_stats(self):
+        terms = self.clf.tokenize(self.finance[0])
+        before = self.clf.class_counts["class_1"]
+        self.clf.remove_document(terms, ["class_1"])
+        self.assertEqual(self.clf.class_counts["class_1"], before - 1)
+
+    def test_save_load(self):
+        path = tempfile.mktemp(suffix=".json")
+        try:
+            self.clf.save(path)
+            restored = IncrementalTextClassifier(path=path)
+            text = "算法工程师部署机器学习接口并修复服务器漏洞"
+            a = self.clf.classify(text)
+            b = restored.classify(text)
+            self.assertEqual(a["fingerprint"], b["fingerprint"])
+            self.assertEqual(a["candidates"], b["candidates"])
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+@unittest.skipIf(create_app is None, reason="未安装 Flask")
+class TestClassifierAPI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.client = create_app(self.tmp).test_client()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _create_examples(self):
+        classes = []
+        for name, desc in [("财务", "发票预算"), ("技术", "算法系统")]:
+            resp = self.client.post("/api/classifier/classes",
+                                    json={"name": name, "description": desc})
+            classes.append(resp.get_json()["id"])
+        examples = [
+            (classes[0], "财务审计发票报销预算和税务申报"),
+            (classes[0], "公司核算营业收入成本利润和现金流"),
+            (classes[1], "算法团队训练机器学习模型并优化服务器"),
+            (classes[1], "后端发布微服务接口并修复系统漏洞"),
+        ]
+        for cid, text in examples:
+            resp = self.client.post("/api/classifier/examples",
+                                    json={"label_ids": [cid], "text": text})
+            self.assertEqual(resp.status_code, 200)
+        return classes
+
+    def test_train_classify_and_incremental_persistence(self):
+        classes = self._create_examples()
+        resp = self.client.post("/api/classifier/classify", json={
+            "text": "请提交发票，财务部门完成报销审计"
+        })
+        self.assertEqual(resp.status_code, 200)
+        result = resp.get_json()
+        self.assertEqual(result["label_ids"], [classes[0]])
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "models", "classifier.json")))
+
+        new_client = create_app(self.tmp).test_client()
+        resp = new_client.get("/api/classifier/model")
+        self.assertEqual(resp.get_json()["stats"]["document_count"], 4)
+        resp = new_client.post("/api/classifier/classify", json={
+            "text": "请提交发票，财务部门完成报销审计"
+        })
+        self.assertEqual(resp.get_json()["label_ids"], [classes[0]])
+
+    def test_mixed_example_supports_multiple_labels(self):
+        classes = self._create_examples()
+        resp = self.client.post("/api/classifier/examples", json={
+            "label_ids": classes,
+            "text": "财务审计模型自动识别发票并接入报销系统",
+        })
+        self.assertEqual(resp.status_code, 200)
+        record = self.client.get("/api/classifier/examples").get_json()["examples"][0]
+        self.assertEqual(set(record["label_ids"]), set(classes))
+
+
 class TestHMM(unittest.TestCase):
     def test_viterbi(self):
         hmm = HMM(["A", "B"], add_k=0.1)
@@ -174,6 +315,13 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(store.stats()["shard_count"], 3)
         self.assertEqual(len(store.query(where=[("v", "gt", 20)])), 4)
         self.assertEqual(len(store.query(where=[("v", "in", [1, 2, 3])])), 3)
+
+    def test_update(self):
+        store = ShardedStore(self.tmp, "t", shard_size=10)
+        rid = store.insert({"name": "old", "v": 1})
+        updated = store.update(rid, {"name": "new", "v": 2})
+        self.assertEqual(updated["name"], "new")
+        self.assertEqual(store.get(rid)["v"], 2)
 
     def test_delete_compact(self):
         store = ShardedStore(self.tmp, "t", shard_size=10)
@@ -220,6 +368,25 @@ class TestPipeline(unittest.TestCase):
         self.assertIn("words", out)
         self.assertIn("pos", out)
         self.assertIn("sentiment", out)
+
+    def test_classify_stage(self):
+        from nlp import get_classifier
+        clf = get_classifier()
+        clf.classes = {}
+        clf.model_version = 0
+        clf.next_class_id = 1
+        clf.document_count = 0
+        clf.df = {}
+        clf.class_counts = {}
+        clf.class_term_weights = {}
+        clf.add_class("class_1", "财务")
+        clf.add_class("class_2", "技术")
+        clf.add_document("财务审计发票报销预算和税务申报", ["class_1"])
+        clf.add_document("算法团队训练机器学习模型并修复系统漏洞", ["class_2"])
+        cfg = {"name": "p", "stages": [{"name": "classify"}]}
+        out = self.engine.build(cfg).run({"text": "请提交发票报销并完成财务审计"})
+        self.assertIn("classification", out)
+        self.assertEqual(out["classification"]["label_ids"], ["class_1"])
 
     def test_batch(self):
         cfg = {"name": "p", "stages": [{"name": "segment"}, {"name": "keywords"}]}

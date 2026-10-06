@@ -10,14 +10,16 @@ import json
 import re
 import time
 import uuid
+import threading
 from typing import Optional
 
 from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+                 get_tagger, get_translator, get_classifier, ENTITY_TYPE_NAMES,
+                 TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+from nlp.classifier import IncrementalTextClassifier
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
 
@@ -44,12 +46,110 @@ def _models_dir() -> str:
     return path
 
 
+def classifier_model_path(data_root: str) -> str:
+    import os
+    return os.path.join(data_root, "models", "classifier.json")
+
+
+def _classifier_path() -> str:
+    return classifier_model_path(current_app.config["DATA_ROOT"])
+
+
+def _classifier() -> IncrementalTextClassifier:
+    return get_classifier(_classifier_path())
+
+
+_CLASSIFIER_LOCK = threading.RLock()
+
+
+def _class_store():
+    return _registry().task("classifier_class")
+
+
+def _example_store():
+    return _registry().task("classifier_example")
+
+
+def _save_classifier() -> None:
+    _classifier().save(_classifier_path())
+
+
+def bootstrap_classifier(registry: StoreRegistry, data_root: str) -> IncrementalTextClassifier:
+    """从磁盘载入分类模型；若已有分片但缺模型文件，则完整重建。"""
+    import os
+    path = classifier_model_path(data_root)
+    classifier = get_classifier(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    has_classes = any(
+        not r.get("_deleted") for r in registry.task("classifier_class").all()
+    )
+    if not os.path.exists(path) and has_classes:
+        _rebuild_classifier_bootstrap(classifier, registry, path)
+    return classifier
+
+
+def _rebuild_classifier_bootstrap(classifier: IncrementalTextClassifier,
+                                  registry: StoreRegistry, path: str) -> None:
+    classifier.classes = {}
+    classifier.model_version = 0
+    classifier.next_class_id = 1
+    max_num = 0
+    for record in registry.task("classifier_class").all():
+        if record.get("_deleted"):
+            continue
+        cid = record.get("id", "")
+        classifier.add_class(
+            cid, record.get("name", cid),
+            description=record.get("description", ""),
+            created_at=record.get("created_at"))
+        if cid.startswith("class_"):
+            try:
+                max_num = max(max_num, int(cid.split("_", 1)[1]))
+            except ValueError:
+                pass
+    classifier.next_class_id = max_num + 1
+    classifier.fit(registry.task("classifier_example").all())
+    classifier.save(path)
+
+
+def _rebuild_classifier() -> None:
+    """以分类/示例两个分片为事实源重建增量统计。"""
+    _rebuild_classifier_bootstrap(_classifier(), _registry(), _classifier_path())
+
+
+def _ensure_classifier_ready() -> Optional[tuple]:
+    if len([c for c in _classifier().list_classes() if c["example_count"] > 0]) < 2:
+        return jsonify({"error": "请先为至少两个类别添加示例"}), 400
+    return None
+
+
 def _store_result(task: str, text: str, result: dict,
                   corpus_id: Optional[str] = None) -> str:
     record = {"text": text, "result": result, "created_at": time.time()}
     if corpus_id:
         record["corpus_id"] = corpus_id
     return _registry().task(task).insert(record)
+
+
+def _store_classification_result(text: str, result: dict,
+                                 corpus_id: Optional[str] = None) -> str:
+    record = {
+        "text": text,
+        "status": result["status"],
+        "label_ids": result["label_ids"],
+        "labels": result["labels"],
+        "confidence": result["confidence"],
+        "candidates": result["candidates"],
+        "fit": result.get("fit"),
+        "margin": result.get("margin"),
+        "model_version": result["model_version"],
+        "fingerprint": result["fingerprint"],
+        "thresholds": result.get("thresholds", {}),
+        "created_at": time.time(),
+    }
+    if corpus_id:
+        record["corpus_id"] = corpus_id
+    return _registry().task("classification").insert(record)
 
 
 def _payload() -> dict:
@@ -441,6 +541,294 @@ def _load_embeddings():
 
 
 # ---------------------------------------------------------------------------
+# 自动文本分类（增量 TF-IDF 质心）
+# ---------------------------------------------------------------------------
+
+def _classification_thresholds(data: dict) -> dict:
+    keys = ("accept_confidence", "review_confidence", "ambiguous_confidence",
+            "min_fit", "margin", "ratio", "temperature")
+    result = {}
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if key == "temperature":
+            if 0.01 <= number <= 1.0:
+                result[key] = number
+        elif 0.0 <= number <= 1.0:
+            result[key] = number
+    return result
+
+
+@api.get("/classifier/classes")
+def classifier_classes():
+    classifier = _classifier()
+    return jsonify({
+        "classes": classifier.list_classes(),
+        "profile": classifier.profile(),
+        "stats": classifier.stats(),
+    })
+
+
+@api.post("/classifier/classes")
+def create_classifier_class():
+    data = _payload()
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "类别名称不能为空"}), 400
+    with _CLASSIFIER_LOCK:
+        classifier = _classifier()
+        cid = classifier.reserve_class_id()
+        record = {
+            "id": cid,
+            "name": name,
+            "description": (data.get("description") or "").strip(),
+            "created_at": time.time(),
+        }
+        _class_store().insert(record)
+        classifier.add_class(cid, name, record["description"], record["created_at"])
+        _save_classifier()
+        return jsonify({"id": cid, "class": {
+            "id": cid,
+            "name": name,
+            "description": record["description"],
+            "example_count": 0,
+            "created_at": record["created_at"],
+        }, "ok": True})
+
+
+@api.put("/classifier/classes/<cid>")
+def update_classifier_class(cid: str):
+    data = _payload()
+    with _CLASSIFIER_LOCK:
+        class_record = _class_store().get(cid)
+        if not class_record or class_record.get("_deleted"):
+            return jsonify({"error": "类别不存在"}), 404
+        name = (data.get("name") or class_record.get("name", cid)).strip()
+        description = (data.get("description")
+                       if data.get("description") is not None
+                       else class_record.get("description", ""))
+        if not name:
+            return jsonify({"error": "类别名称不能为空"}), 400
+        _class_store().update(cid, {
+            "name": name,
+            "description": description,
+            "updated_at": time.time(),
+        })
+        _classifier().update_class(cid, name=name, description=description)
+        _save_classifier()
+        return jsonify({"id": cid, "ok": True})
+
+
+@api.delete("/classifier/classes/<cid>")
+def delete_classifier_class(cid: str):
+    with _CLASSIFIER_LOCK:
+        class_record = _class_store().get(cid)
+        if not class_record or class_record.get("_deleted"):
+            return jsonify({"error": "类别不存在"}), 404
+        classifier = _classifier()
+        examples = _example_store().all()
+        removed_examples = 0
+        for example in examples:
+            if example.get("_deleted") or cid not in example.get("label_ids", []):
+                continue
+            labels = [label for label in example.get("label_ids", []) if label != cid]
+            if labels:
+                terms = example.get("terms", [])
+                classifier.remove_document(terms, example.get("label_ids", []))
+                label_names = [classifier.classes[label]["name"] for label in labels]
+                classifier.add_document(example.get("text", ""), labels, terms=terms)
+                _example_store().update(example["id"], {
+                    "label_ids": labels,
+                    "labels": label_names,
+                    "updated_at": time.time(),
+                })
+            else:
+                classifier.remove_document(example.get("terms", []),
+                                           example.get("label_ids", []))
+                _example_store().delete(example["id"])
+            removed_examples += 1
+        classifier.remove_class(cid)
+        _class_store().delete(cid)
+        _save_classifier()
+        return jsonify({"ok": True, "removed_examples": removed_examples})
+
+
+@api.get("/classifier/examples")
+def list_classifier_examples():
+    cid = request.args.get("class_id")
+    where = [("label_ids", "contains", cid)] if cid else None
+    records = _example_store().query(where=where, order_by="_created", order="desc")
+    return jsonify({"examples": records})
+
+
+@api.post("/classifier/examples")
+def add_classifier_example():
+    data = _payload()
+    text = (data.get("text") or "").strip()
+    label_ids = data.get("label_ids") or []
+    if isinstance(label_ids, str):
+        label_ids = [label_ids]
+    if not text:
+        return jsonify({"error": "示例文本不能为空"}), 400
+    if not label_ids:
+        return jsonify({"error": "请至少选择一个类别"}), 400
+
+    with _CLASSIFIER_LOCK:
+        classifier = _classifier()
+        missing = [cid for cid in label_ids if cid not in classifier.classes]
+        if missing:
+            return jsonify({"error": f"类别不存在: {', '.join(missing)}"}), 400
+        terms = classifier.tokenize(text)
+        if not terms:
+            return jsonify({"error": "示例没有可用特征词，请补充更有内容的文本"}), 400
+        label_names = [classifier.classes[cid]["name"] for cid in label_ids]
+        record = {
+            "text": text,
+            "label_ids": label_ids,
+            "labels": label_names,
+            "terms": terms,
+            "source": data.get("source", "manual"),
+            "created_at": time.time(),
+        }
+        eid = _example_store().insert(record)
+        classifier.add_document(text, label_ids, terms=terms)
+        _save_classifier()
+        record["id"] = eid
+        return jsonify({"id": eid, "example": record,
+                        "stats": classifier.stats(), "ok": True})
+
+
+@api.patch("/classifier/examples/<eid>")
+def update_classifier_example(eid: str):
+    data = _payload()
+    with _CLASSIFIER_LOCK:
+        record = _example_store().get(eid)
+        if not record or record.get("_deleted"):
+            return jsonify({"error": "示例不存在"}), 404
+        classifier = _classifier()
+        classifier.remove_document(record.get("terms", []), record.get("label_ids", []))
+
+        text = (data.get("text") or record.get("text", "")).strip()
+        label_ids = data.get("label_ids") or record.get("label_ids", [])
+        if isinstance(label_ids, str):
+            label_ids = [label_ids]
+        missing = [cid for cid in label_ids if cid not in classifier.classes]
+        if missing:
+            # 回滚内存状态，避免一次失败请求改变模型
+            classifier.add_document(record.get("text", ""),
+                                    record.get("label_ids", []),
+                                    terms=record.get("terms", []))
+            return jsonify({"error": f"类别不存在: {', '.join(missing)}"}), 400
+        terms = classifier.tokenize(text)
+        if not terms:
+            classifier.add_document(record.get("text", ""),
+                                    record.get("label_ids", []),
+                                    terms=record.get("terms", []))
+            return jsonify({"error": "示例没有可用特征词"}), 400
+        label_names = [classifier.classes[cid]["name"] for cid in label_ids]
+        _example_store().update(eid, {
+            "text": text,
+            "label_ids": label_ids,
+            "labels": label_names,
+            "terms": terms,
+            "updated_at": time.time(),
+        })
+        classifier.add_document(text, label_ids, terms=terms)
+        _save_classifier()
+        return jsonify({"id": eid, "ok": True})
+
+
+@api.delete("/classifier/examples/<eid>")
+def delete_classifier_example(eid: str):
+    with _CLASSIFIER_LOCK:
+        record = _example_store().get(eid)
+        if not record or record.get("_deleted"):
+            return jsonify({"error": "示例不存在"}), 404
+        _classifier().remove_document(record.get("terms", []),
+                                      record.get("label_ids", []))
+        _example_store().delete(eid)
+        _save_classifier()
+        return jsonify({"ok": True, "stats": _classifier().stats()})
+
+
+def _run_classification(text: str, data: dict, persist: bool = True) -> dict:
+    thresholds = _classification_thresholds(data)
+    with _CLASSIFIER_LOCK:
+        classifier = _classifier()
+        result = classifier.classify(text, thresholds=thresholds)
+        if persist:
+            result["id"] = _store_classification_result(
+                text, result, corpus_id=data.get("corpus_id"))
+        return result
+
+
+@api.post("/classifier/classify")
+def classify_text():
+    not_ready = _ensure_classifier_ready()
+    if not_ready:
+        return not_ready
+    data = _payload()
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少待分类文本"}), 400
+    data = dict(data)
+    data["corpus_id"] = cid
+    try:
+        return jsonify(_run_classification(text, data))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@api.post("/classifier/classify-batch")
+def classify_corpus_batch():
+    not_ready = _ensure_classifier_ready()
+    if not_ready:
+        return not_ready
+    data = _payload()
+    store = _registry().task("corpus")
+    corpus_ids = data.get("corpus_ids") or []
+    if corpus_ids:
+        documents = []
+        for cid in corpus_ids:
+            record = store.get(cid)
+            if record and not record.get("_deleted"):
+                documents.append((cid, record.get("text", "")))
+    else:
+        documents = [(r["id"], r.get("text", "")) for r in store.all()
+                     if not r.get("_deleted")]
+    if not documents:
+        return jsonify({"error": "没有可分类的文档"}), 400
+    results = []
+    for cid, text in documents:
+        payload = dict(data)
+        payload["corpus_id"] = cid
+        results.append({
+            "corpus_id": cid,
+            "preview": text[:120],
+            "result": _run_classification(text, payload),
+        })
+    return jsonify({"count": len(results), "results": results})
+
+
+@api.get("/classifier/model")
+def classifier_model():
+    classifier = _classifier()
+    return jsonify({"stats": classifier.stats(), "profile": classifier.profile()})
+
+
+@api.post("/classifier/rebuild")
+def rebuild_classifier_model():
+    with _CLASSIFIER_LOCK:
+        _rebuild_classifier()
+        return jsonify({"ok": True, "stats": _classifier().stats()})
+
+
+# ---------------------------------------------------------------------------
 # 流水线配置与执行
 # ---------------------------------------------------------------------------
 
@@ -488,7 +876,10 @@ def pipeline_preview():
     if not text or not config:
         return jsonify({"error": "缺少文本或配置"}), 400
     try:
-        result = _engine().build(config).run({"text": text})
+        result = _engine().build(config).run({
+            "text": text,
+            "classifier_path": _classifier_path(),
+        })
         return jsonify({"ok": True, "output": result})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -523,8 +914,10 @@ def run_pipeline(pid: str):
             progress_state["done"] = done
             progress_state["total"] = total
 
+        shared = dict(data.get("shared") or {})
+        shared.setdefault("classifier_path", _classifier_path())
         results = _engine().run_batch(
-            config, docs, shared=data.get("shared"),
+            config, docs, shared=shared,
             max_workers=data.get("max_workers", 4),
             chunk_size=data.get("chunk_size", 16),
             progress=_progress)
@@ -544,7 +937,10 @@ def run_pipeline(pid: str):
         if not text:
             return jsonify({"error": "缺少文本"}), 400
         try:
-            output = _engine().build(config).run({"text": text})
+            output = _engine().build(config).run({
+                "text": text,
+                "classifier_path": _classifier_path(),
+            })
             run_record = {
                 "run_id": run_id, "pipeline_id": pid, "batch": False,
                 "text": text, "output": output,
@@ -575,7 +971,8 @@ def list_result_tasks():
     registry = _registry()
     tasks = []
     for name in registry.tasks():
-        if name in ("corpus", "pipeline_config", "annotation"):
+        if name in ("corpus", "pipeline_config", "annotation",
+                    "classifier_class", "classifier_example"):
             continue
         stats = registry.task(name).stats()
         tasks.append(stats)

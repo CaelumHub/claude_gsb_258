@@ -1,4 +1,4 @@
-"""NLP 算法包：分词、词性标注、句法分析、NER、情感、摘要、翻译、关键词、词向量。
+"""NLP 算法包：分词、词性标注、句法分析、NER、情感、摘要、翻译、关键词、词向量、文档分类。
 
 对外暴露线程安全的惰性单例，避免为每次请求重建模型。
 """
@@ -16,16 +16,18 @@ from .summarizer import Summarizer
 from .translator import Translator
 from .keywords import KeywordExtractor
 from .embeddings import WordEmbeddings
+from .classifier import DocumentClassifier
 from . import lexicon, text, hmm
 
 __all__ = [
     "Segmenter", "POSTagger", "DependencyParser", "ConstituencyParser",
     "NERExtractor", "SentimentAnalyzer", "Summarizer", "Translator",
-    "KeywordExtractor", "WordEmbeddings",
+    "KeywordExtractor", "WordEmbeddings", "DocumentClassifier",
     "TAG_NAMES", "TAGSET", "DEP_REL_NAMES", "PHRASE_NAMES", "ENTITY_TYPE_NAMES",
     "POLARITY_NAMES", "lexicon", "text", "hmm",
     "get_segmenter", "get_tagger", "get_parser", "get_ner", "get_sentiment",
     "get_summarizer", "get_translator", "get_keywords", "get_embeddings",
+    "get_classifier",
 ]
 
 
@@ -78,3 +80,7 @@ def get_keywords() -> KeywordExtractor:
 
 def get_embeddings() -> WordEmbeddings:
     return _singleton("embeddings", WordEmbeddings)
+
+
+def get_classifier() -> DocumentClassifier:
+    return _singleton("classifier", DocumentClassifier)

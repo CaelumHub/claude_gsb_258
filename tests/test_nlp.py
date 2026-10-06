@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from nlp import (get_segmenter, get_tagger, get_parser, get_constituency_parser,
                  get_ner, get_sentiment, get_summarizer, get_translator,
                  get_keywords, get_embeddings, TAGSET)
+from nlp.classifier import DocumentClassifier
 from nlp.hmm import HMM
 from pipeline import PipelineEngine, PipelineError
 from storage import ShardedStore, StoreRegistry
@@ -240,6 +241,115 @@ class TestPipeline(unittest.TestCase):
         cfg = {"name": "p", "stages": [{"name": "not_exist"}]}
         with self.assertRaises(PipelineError):
             self.engine.build(cfg)
+
+
+class TestClassifier(unittest.TestCase):
+    """文档自动分类：少样本学习、增量一致性、确定性、拒识与多候选。"""
+
+    EXAMPLES = {
+        "cat_sports": ("体育", ["足球比赛球队进球获胜", "篮球联赛球员夺得冠军",
+                              "运动员在奥运会比赛中获得金牌"]),
+        "cat_tech": ("科技", ["计算机软件算法与人工智能", "互联网平台数据系统开发",
+                            "机器学习模型深度神经网络"]),
+        "cat_finance": ("财经", ["股票市场投资与经济增长", "银行贷款利率金融市场",
+                              "企业利润营收财报"]),
+    }
+
+    def _trained(self) -> DocumentClassifier:
+        clf = DocumentClassifier()
+        for cid, (name, texts) in self.EXAMPLES.items():
+            clf.add_category(cid, name)
+            for t in texts:
+                clf.add_example(cid, t)
+        return clf
+
+    def test_basic_label_and_confidence(self):
+        clf = self._trained()
+        r = clf.classify("足球运动员在决赛中进球")
+        self.assertTrue(r["accepted"])
+        self.assertEqual(r["label"], "体育")
+        self.assertGreater(r["confidence"], 0)
+        self.assertLessEqual(r["confidence"], 1)
+        self.assertTrue(r["candidates"])
+        self.assertIn("matched", r["candidates"][0])
+
+    def test_deterministic_repeated_classify(self):
+        clf = self._trained()
+        r1 = clf.classify("互联网平台使用机器学习算法")
+        r2 = clf.classify("互联网平台使用机器学习算法")
+        self.assertEqual(r1, r2)
+
+    def test_incremental_equals_full_rebuild(self):
+        """增量学习的状态必须与全量重建逐位一致（边界随示例调整）。"""
+        clf = self._trained()
+        rebuilt = DocumentClassifier()
+        rebuilt.rebuild([(cid, name, t)
+                         for cid, (name, texts) in self.EXAMPLES.items()
+                         for t in texts])
+        self.assertEqual(clf.fingerprint(), rebuilt.fingerprint())
+        self.assertEqual(clf.classify("股票市场上涨"),
+                         rebuilt.classify("股票市场上涨"))
+
+    def test_remove_example_exact_undo(self):
+        """删除示例精确抵消其贡献，模型回到添加前的状态。"""
+        clf = self._trained()
+        before = clf.fingerprint()
+        clf.add_example("cat_sports", "排球锦标赛夺得冠军")
+        self.assertNotEqual(clf.fingerprint(), before)
+        clf.remove_example("cat_sports", "排球锦标赛夺得冠军")
+        self.assertEqual(clf.fingerprint(), before)
+
+    def test_ambiguous_returns_multiple_candidates(self):
+        """边界模糊的文档应给出多个候选，而不是硬塞一个类别。"""
+        clf = DocumentClassifier()
+        clf.add_category("a", "甲类")
+        clf.add_example("a", "apple banana")
+        clf.add_category("b", "乙类")
+        clf.add_example("b", "apple cherry")
+        r = clf.classify("apple")
+        self.assertTrue(r["accepted"])
+        self.assertTrue(r["ambiguous"])
+        self.assertEqual(len(r["candidates"]), 2)
+        self.assertEqual(r["candidates"][0]["confidence"],
+                         r["candidates"][1]["confidence"])
+
+    def test_abstain_on_unrelated_text(self):
+        """与所有类别都无关的文档应拒识，不乱塞类别。"""
+        clf = self._trained()
+        r = clf.classify("芭蕾歌剧")
+        self.assertFalse(r["accepted"])
+        self.assertIsNone(r["label"])
+        self.assertEqual(r["candidates"], [])
+
+    def test_save_load_roundtrip(self):
+        clf = self._trained()
+        tmp = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmp, "classifier.json")
+            clf.save(path)
+            restored = DocumentClassifier()
+            restored.load(path)
+            self.assertEqual(clf.fingerprint(), restored.fingerprint())
+            self.assertEqual(clf.classify("篮球比赛"),
+                             restored.classify("篮球比赛"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_untrained_model_raises(self):
+        with self.assertRaises(ValueError):
+            DocumentClassifier().classify("任意文本")
+
+    def test_empty_example_rejected(self):
+        clf = DocumentClassifier()
+        with self.assertRaises(ValueError):
+            clf.add_example("c1", "！！！")
+
+    def test_remove_category_updates_stats(self):
+        clf = self._trained()
+        clf.remove_category("cat_finance")
+        self.assertEqual(clf.stats()["n_docs"], 6)
+        r = clf.classify("股票市场投资")
+        self.assertNotIn("财经", [c["name"] for c in r["candidates"]])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智能文档分类 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .verdict { padding: 10px 14px; border-radius: 8px; font-weight: 600; margin-bottom: 12px; }
+    .verdict.ok { background: #e8f7ee; color: #1a7f4b; }
+    .verdict.multi { background: #fff6e0; color: #9a6a00; }
+    .verdict.warn { background: #fdecec; color: #b3352b; }
+    .bar { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+    .bar .name { width: 110px; font-weight: 600; text-align: right; }
+    .bar .track { flex: 1; height: 10px; background: #eef0f6; border-radius: 999px; overflow: hidden; }
+    .bar .fill { height: 100%; background: var(--primary); border-radius: 999px; }
+    .bar .sc { width: 170px; font-size: 12px; color: var(--text-muted); font-family: var(--mono); }
+    .matched { font-size: 12px; color: var(--text-muted); margin: -2px 0 8px 120px; }
+    .term { display: inline-block; margin: 2px 3px 2px 0; padding: 1px 8px; border-radius: 999px;
+      font-size: 12px; background: var(--primary-soft); color: var(--primary); }
+    .cat-head { display: flex; align-items: center; gap: 8px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">智能文档分类</h1>
+    <p class="page-desc">为每个类别提供少量示例，平台增量学习类别边界；新文档自动归入最合适类别并给出置信度，边界模糊时给出多个候选，置信度不足时不强行归类。</p>
+
+    <div class="grid cols-2">
+      <!-- 类别管理 -->
+      <section class="card">
+        <h2>类别管理</h2>
+        <div class="row">
+          <input type="text" id="cat-name" placeholder="类别名称，如：体育">
+          <input type="text" id="cat-desc" placeholder="描述（可选）">
+          <button class="btn" id="btn-add-cat">添加类别</button>
+        </div>
+        <div class="list mt" id="cat-list"><div class="muted">加载中…</div></div>
+      </section>
+
+      <!-- 示例管理 -->
+      <section class="card">
+        <h2>示例管理</h2>
+        <div class="mb">
+          <label>选择类别</label>
+          <select id="ex-cat"></select>
+        </div>
+        <textarea id="ex-text" style="min-height:70px" placeholder="粘贴一篇属于该类别的示例文档…"></textarea>
+        <div class="row mt">
+          <button class="btn" id="btn-add-ex">添加示例（增量学习）</button>
+        </div>
+        <div class="list mt" id="ex-list"><div class="muted">请先选择类别。</div></div>
+      </section>
+    </div>
+
+    <!-- 分类 -->
+    <section class="card">
+      <h2>文档分类</h2>
+      <div class="row mb">
+        <select id="cls-corpus" style="max-width:320px"><option value="">（从语料库选择文档，或直接输入）</option></select>
+        <div style="width:130px"><input type="number" id="topk" value="3" min="1" max="10" title="候选数量"></div>
+      </div>
+      <textarea id="cls-text" style="min-height:110px" placeholder="输入或粘贴待分类的文档…"></textarea>
+      <div class="row mt">
+        <button class="btn" id="btn-classify">开始分类</button>
+        <button class="btn secondary" id="btn-classify-again" style="display:none">再分一次（验证一致性）</button>
+      </div>
+      <div class="mt" id="cls-result"><div class="muted">尚未分类。</div></div>
+    </section>
+
+    <!-- 模型状态 -->
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">模型状态</h2>
+        <button class="btn secondary small" id="btn-rebuild">从示例重新学习</button>
+        <button class="btn secondary small" id="btn-refresh">刷新</button>
+      </div>
+      <div id="model-stats" class="muted small">加载中…</div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("classify.html");
+
+let categories = [];
+
+/* ---------- 数据加载 ---------- */
+async function loadAll() {
+  try {
+    const data = await api("/api/classifier/categories");
+    categories = data.categories;
+    renderCategories();
+    renderModel(data.model);
+    loadCorpora();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function renderCategories() {
+  const list = $("#cat-list");
+  if (!categories.length) {
+    list.innerHTML = '<div class="muted">暂无类别，请先添加。</div>';
+  } else {
+    list.innerHTML = categories.map(c => `
+      <div class="list-item">
+        <div class="meta">
+          <div class="cat-head">
+            <span class="name">${esc(c.name)}</span>
+            <span class="badge blue small">${c.n_docs} 个示例</span>
+          </div>
+          ${c.description ? `<div class="sub">${esc(c.description)}</div>` : ""}
+          <div class="sub">依据词项：${c.top_terms.map(t => `<span class="term">${esc(t)}</span>`).join("") || "—"}</div>
+        </div>
+        <button class="btn danger small" onclick="delCategory('${esc(c.id)}')">删除</button>
+      </div>`).join("");
+  }
+  const sel = $("#ex-cat");
+  const cur = sel.value;
+  sel.innerHTML = categories.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+  if (cur && categories.some(c => c.id === cur)) sel.value = cur;
+  loadExamples();
+}
+
+function renderModel(m) {
+  $("#model-stats").innerHTML = `
+    已学习 <strong>${m.n_docs}</strong> 个示例 · 词表 <strong>${m.vocab_size}</strong> 词 ·
+    ${m.categories.length} 个类别 · 模型指纹 <code>${m.fingerprint}</code>
+    <div class="muted small mt">同一文档在同一模型状态下多次分类，结果与置信度完全一致；新增 / 删除示例即时生效，无需全库重学。</div>`;
+}
+
+async function loadExamples() {
+  const cid = $("#ex-cat").value;
+  const list = $("#ex-list");
+  if (!cid) { list.innerHTML = '<div class="muted">请先添加类别。</div>'; return; }
+  try {
+    const data = await api(`/api/classifier/categories/${cid}/examples`);
+    list.innerHTML = data.examples.length ? data.examples.map(e => `
+      <div class="list-item">
+        <div class="meta"><div class="preview">${esc(e.text.slice(0, 80))}</div></div>
+        <button class="btn danger small" onclick="delExample('${esc(e.id)}')">删除</button>
+      </div>`).join("") : '<div class="muted">该类别暂无示例。</div>';
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function loadCorpora() {
+  try {
+    const data = await api("/api/corpus");
+    const sel = $("#cls-corpus");
+    sel.innerHTML = '<option value="">（从语料库选择文档，或直接输入）</option>' +
+      data.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+  } catch (e) { /* 语料为空时忽略 */ }
+}
+
+/* ---------- 类别 / 示例操作 ---------- */
+async function addCategory() {
+  const name = $("#cat-name").value.trim();
+  if (!name) return toast("请输入类别名称", "err");
+  try {
+    await api("/api/classifier/categories", {
+      method: "POST", body: { name, description: $("#cat-desc").value.trim() } });
+    $("#cat-name").value = ""; $("#cat-desc").value = "";
+    toast("类别已添加"); loadAll();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function delCategory(id) {
+  if (!confirm("删除类别将同时删除其全部示例，确认？")) return;
+  try {
+    await api(`/api/classifier/categories/${id}`, { method: "DELETE" });
+    toast("类别已删除"); loadAll();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function addExample() {
+  const cid = $("#ex-cat").value;
+  const text = $("#ex-text").value.trim();
+  if (!cid) return toast("请先选择类别", "err");
+  if (!text) return toast("请输入示例文本", "err");
+  const btn = $("#btn-add-ex");
+  setLoading(btn, true, "学习中…");
+  try {
+    const r = await api(`/api/classifier/categories/${cid}/examples`, {
+      method: "POST", body: { text } });
+    $("#ex-text").value = "";
+    toast(`已学习，模型共 ${r.n_docs} 个示例`);
+    loadAll();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+async function delExample(id) {
+  try {
+    await api(`/api/classifier/examples/${id}`, { method: "DELETE" });
+    toast("示例已移除，类别边界已更新"); loadAll();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- 分类 ---------- */
+let lastResult = null;
+
+async function classify() {
+  const text = $("#cls-text").value.trim();
+  if (!text) return toast("请输入待分类文本", "err");
+  const btn = $("#btn-classify");
+  setLoading(btn, true, "分类中…");
+  try {
+    const r = await api("/api/classify", {
+      method: "POST", body: { text, top_k: parseInt($("#topk").value) || 3 } });
+    renderResult(r);
+    if (lastResult) {
+      const same = JSON.stringify({ ...r, id: null }) === JSON.stringify({ ...lastResult, id: null });
+      toast(same ? "与上次分类结果一致" : "注意：模型已更新，结果发生变化", same ? "ok" : "err");
+    }
+    lastResult = r;
+    $("#btn-classify-again").style.display = "";
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function renderResult(r) {
+  let head;
+  if (!r.accepted) {
+    head = `<div class="verdict warn">⚠ 置信度不足，未强行归入任何类别</div>`;
+  } else if (r.ambiguous) {
+    head = `<div class="verdict multi">◈ 类别边界模糊，给出 ${r.candidates.length} 个候选（最高置信度 ${(r.confidence * 100).toFixed(1)}%）</div>`;
+  } else {
+    head = `<div class="verdict ok">✓ 归入「${esc(r.label)}」，置信度 ${(r.confidence * 100).toFixed(1)}%</div>`;
+  }
+  const bars = r.candidates.map(c => `
+    <div class="bar">
+      <span class="name">${esc(c.name)}</span>
+      <div class="track"><div class="fill" style="width:${(c.confidence * 100).toFixed(1)}%"></div></div>
+      <span class="sc">置信 ${c.confidence} · 相似 ${c.score}</span>
+    </div>
+    <div class="matched">分类依据：${c.matched.map(t => `<span class="term">${esc(t)}</span>`).join("") || "—"}</div>`).join("");
+  $("#cls-result").innerHTML = head + (bars || '<div class="muted">没有候选类别。</div>');
+}
+
+/* ---------- 事件 ---------- */
+$("#btn-add-cat").addEventListener("click", addCategory);
+$("#btn-add-ex").addEventListener("click", addExample);
+$("#btn-classify").addEventListener("click", classify);
+$("#btn-classify-again").addEventListener("click", classify);
+$("#btn-refresh").addEventListener("click", loadAll);
+$("#btn-rebuild").addEventListener("click", async () => {
+  try {
+    const m = await api("/api/classifier/rebuild", { method: "POST" });
+    toast(`已从 ${m.n_docs} 个示例重新学习`); loadAll();
+  } catch (e) { toast(e.message, "err"); }
+});
+$("#ex-cat").addEventListener("change", loadExamples);
+$("#cls-corpus").addEventListener("change", async (ev) => {
+  const id = ev.target.value;
+  if (!id) return;
+  try {
+    const r = await api(`/api/corpus/${id}`);
+    $("#cls-text").value = r.text;
+  } catch (e) { toast(e.message, "err"); }
+});
+
+loadAll();
+</script>
+</body>
+</html>

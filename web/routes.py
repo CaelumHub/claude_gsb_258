@@ -16,8 +16,8 @@ from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+                 get_tagger, get_translator, get_classifier, ENTITY_TYPE_NAMES,
+                 TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
 
@@ -441,6 +441,193 @@ def _load_embeddings():
 
 
 # ---------------------------------------------------------------------------
+# 文档自动分类（少样本定义类别 + 增量学习）
+# ---------------------------------------------------------------------------
+
+# 分类模型的内部存储任务，不出现在通用结果查询页
+_CLASSIFIER_STORES = ("classifier_category", "classifier_example")
+
+_clf_state = {"loaded": False}
+
+
+def _classifier_path() -> str:
+    import os
+    return os.path.join(_models_dir(), "classifier.json")
+
+
+def _get_classifier():
+    """取分类器单例；首次访问时从模型文件恢复增量状态。"""
+    import os
+    clf = get_classifier()
+    if not _clf_state["loaded"]:
+        path = _classifier_path()
+        if os.path.exists(path):
+            try:
+                clf.load(path)
+            except (json.JSONDecodeError, OSError):
+                pass  # 模型文件损坏时可通过 /classifier/rebuild 从示例重建
+        _clf_state["loaded"] = True
+    return clf
+
+
+def _save_classifier() -> None:
+    _get_classifier().save(_classifier_path())
+
+
+@api.get("/classifier/categories")
+def classifier_categories():
+    clf = _get_classifier()
+    stats = {c["id"]: c for c in clf.stats()["categories"]}
+    items = []
+    for r in _registry().task("classifier_category").all():
+        if r.get("_deleted"):
+            continue
+        s = stats.get(r["id"], {})
+        items.append({
+            "id": r["id"], "name": r.get("name", ""),
+            "description": r.get("description", ""),
+            "created_at": r.get("created_at"),
+            "n_docs": s.get("n_docs", 0),
+            "top_terms": s.get("top_terms", []),
+        })
+    items.sort(key=lambda x: x.get("created_at") or 0)
+    return jsonify({"categories": items, "model": clf.stats()})
+
+
+@api.post("/classifier/categories")
+def classifier_create_category():
+    data = _payload()
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "类别名称不能为空"}), 400
+    record = {"name": name,
+              "description": (data.get("description") or "").strip(),
+              "created_at": time.time()}
+    rid = _registry().task("classifier_category").insert(record)
+    clf = _get_classifier()
+    clf.add_category(rid, name)
+    _save_classifier()
+    return jsonify({"id": rid, "ok": True})
+
+
+@api.delete("/classifier/categories/<cid>")
+def classifier_delete_category(cid):
+    store = _registry().task("classifier_category")
+    record = store.get(cid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "类别不存在"}), 404
+    # 连同类别下的示例一起删除（墓碑），模型统计同步移除
+    ex_store = _registry().task("classifier_example")
+    for ex in ex_store.query(where=[("category_id", "eq", cid)]):
+        if not ex.get("_deleted"):
+            ex_store.delete(ex["id"])
+    store.delete(cid)
+    _get_classifier().remove_category(cid)
+    _save_classifier()
+    return jsonify({"ok": True})
+
+
+@api.get("/classifier/categories/<cid>/examples")
+def classifier_examples(cid):
+    records = _registry().task("classifier_example").query(
+        where=[("category_id", "eq", cid)])
+    items = [{"id": r["id"], "text": r.get("text", ""),
+              "created_at": r.get("created_at")}
+             for r in records if not r.get("_deleted")]
+    items.sort(key=lambda x: x.get("created_at") or 0)
+    return jsonify({"examples": items})
+
+
+@api.post("/classifier/categories/<cid>/examples")
+def classifier_add_examples(cid):
+    cat = _registry().task("classifier_category").get(cid)
+    if not cat or cat.get("_deleted"):
+        return jsonify({"error": "类别不存在"}), 404
+    data = _payload()
+    texts = data.get("texts")
+    if not texts:
+        single = (data.get("text") or "").strip()
+        texts = [single] if single else []
+    texts = [t.strip() for t in texts if t and t.strip()]
+    if not texts:
+        return jsonify({"error": "示例文本不能为空"}), 400
+
+    clf = _get_classifier()
+    # 先整体校验，避免批量添加时部分成功
+    for t in texts:
+        if not clf.tokenize(t):
+            return jsonify({"error": "示例文本没有可用词项"}), 400
+    store = _registry().task("classifier_example")
+    ids = []
+    for t in texts:
+        clf.add_example(cid, t)          # 增量学习，O(文档词数)
+        ids.append(store.insert({"category_id": cid, "text": t,
+                                 "created_at": time.time()}))
+    _save_classifier()
+    return jsonify({"ids": ids, "ok": True, "n_docs": clf.n_docs})
+
+
+@api.delete("/classifier/examples/<eid>")
+def classifier_delete_example(eid):
+    store = _registry().task("classifier_example")
+    record = store.get(eid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "示例不存在"}), 404
+    clf = _get_classifier()
+    try:
+        # 精确抵消该示例的贡献，类别边界随之调整
+        clf.remove_example(record.get("category_id"), record.get("text", ""))
+    except (KeyError, ValueError):
+        pass  # 模型与存储不一致时以存储为准，可用 rebuild 对齐
+    store.delete(eid)
+    _save_classifier()
+    return jsonify({"ok": True})
+
+
+@api.get("/classifier/model")
+def classifier_model():
+    return jsonify(_get_classifier().stats())
+
+
+@api.post("/classifier/rebuild")
+def classifier_rebuild():
+    """从存储中的示例全量重建模型（与增量状态逐位一致）。"""
+    cats = {r["id"]: r for r in _registry().task("classifier_category").all()
+            if not r.get("_deleted")}
+    examples = []
+    for r in _registry().task("classifier_example").all():
+        if r.get("_deleted") or r.get("category_id") not in cats:
+            continue
+        examples.append((r["category_id"],
+                         cats[r["category_id"]].get("name", ""),
+                         r.get("text", "")))
+    clf = _get_classifier()
+    clf.rebuild(examples)
+    for cid, rec in cats.items():  # 零示例类别也登记，保证名称同步
+        clf.add_category(cid, rec.get("name", ""))
+    _save_classifier()
+    return jsonify(clf.stats())
+
+
+@api.post("/classify")
+def classify():
+    data = _payload()
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    try:
+        result = _get_classifier().classify(
+            text, top_k=data.get("top_k", 3),
+            accept_threshold=data.get("accept_threshold"),
+            margin=data.get("margin"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    rid = _store_result("classify", text, result, corpus_id=cid)
+    result["id"] = rid
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
 # 流水线配置与执行
 # ---------------------------------------------------------------------------
 
@@ -575,7 +762,7 @@ def list_result_tasks():
     registry = _registry()
     tasks = []
     for name in registry.tasks():
-        if name in ("corpus", "pipeline_config", "annotation"):
+        if name in ("corpus", "pipeline_config", "annotation") + _CLASSIFIER_STORES:
             continue
         stats = registry.task(name).stats()
         tasks.append(stats)
